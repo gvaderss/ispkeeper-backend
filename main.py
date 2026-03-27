@@ -25,7 +25,12 @@ Variables opcionales:
 from __future__ import annotations
 import asyncio, csv, io, logging, os
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+
+# Zona horaria Argentina (UTC-3, sin horario de verano)
+ARG_TZ = timezone(timedelta(hours=-3))
+def now_arg() -> datetime:
+    return datetime.now(ARG_TZ)
 from typing import Any
 
 import aiohttp
@@ -207,7 +212,7 @@ async def sync_tickets() -> None:
         return
 
     async with _sync_lock:
-        started = datetime.utcnow()
+        started = now_arg()
 
         try:
             desde  = (date.today() - timedelta(days=DIAS_VENTANA)).isoformat()
@@ -243,7 +248,7 @@ async def sync_tickets() -> None:
 
                 # ── Actualizar caché en memoria ────────────────────────
                 tickets_data = list(buffer.values())
-                now     = datetime.utcnow()
+                now     = now_arg()
                 now_str = now.isoformat()
                 dur     = int((now - started).total_seconds())
 
@@ -277,7 +282,7 @@ async def sync_tickets() -> None:
             err_str = str(exc)
             _last_sync_info = {
                 "started_at":  started.isoformat(),
-                "finished_at": datetime.utcnow().isoformat(),
+                "finished_at": now_arg().isoformat(),
                 "status":      "error",
                 "error_msg":   err_str,
             }
@@ -286,7 +291,7 @@ async def sync_tickets() -> None:
                     async with aiohttp.ClientSession() as session:
                         await _sheets_append_sync_log(session, {
                             "started_at":  started.isoformat(),
-                            "finished_at": datetime.utcnow().isoformat(),
+                            "finished_at": now_arg().isoformat(),
                             "status":      "error",
                             "error_msg":   err_str,
                         })
@@ -376,7 +381,7 @@ def get_historico(dias: int = 30):
     if not content:
         return []
 
-    desde_str = (datetime.utcnow() - timedelta(days=dias)).isoformat()
+    desde_str = (now_arg() - timedelta(days=dias)).isoformat()
     reader = csv.DictReader(io.StringIO(content))
     return [
         row for row in reader
