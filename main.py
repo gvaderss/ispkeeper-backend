@@ -387,12 +387,34 @@ def get_historico(dias: int = 30):
 @app.get("/config")
 async def get_config():
     """
-    Lee la hoja 'config' del Google Sheet y devuelve umbrales y cupos por localidad.
+    Lee la hoja 'config' del Google Sheet y devuelve umbrales y cupos por localidad,
+    indexado por código de grupo (RG, LH, RT, etc.).
     Columnas: A=nombre, B=umbral_inst, C=umbral_rep, D=umbral_mud, E=cupo_inst, F=cupo_rep, G=cupo_mud
     Datos desde fila 3 (se saltan 2 filas de encabezado).
     """
     if not GOOGLE_SHEETS_ID:
         return {"error": "GOOGLE_SHEETS_ID no configurado"}
+
+    # Mapping de nombres del sheet (normalizados) → código de grupo
+    import unicodedata
+
+    def norm(s: str) -> str:
+        s = unicodedata.normalize("NFD", s)
+        s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+        return s.lower().strip()
+
+    SHEET_TO_GRUPO = {
+        "rio gallegos":       "RG",
+        "las heras":          "LH",
+        "rio turbio":         "RT",
+        "gobernador gregores":"GG",
+        "puerto santa cruz":  "SC",
+        "san julian":         "SJ",
+        "piedra buena":       "PB",
+        "perito moreno":      "PM",
+        "tres lagos":         "TL",
+        "pico truncado":      "PC",
+    }
 
     url = (f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEETS_ID}"
            f"/gviz/tq?tqx=out:csv&sheet=config")
@@ -414,7 +436,7 @@ async def get_config():
 
     lines = content.strip().split("\n")
     data_lines = lines[2:]  # saltar 2 filas de encabezado
-    result = []
+    result = {}
     for line in data_lines:
         cols = []
         cur, in_q = "", False
@@ -430,7 +452,10 @@ async def get_config():
         nombre = (cols[0] if cols else "").replace('"', '').strip()
         if not nombre:
             continue
-        result.append({
+        grupo = SHEET_TO_GRUPO.get(norm(nombre))
+        if not grupo:
+            continue
+        result[grupo] = {
             "nombre":      nombre,
             "umbral_inst": parse_num(cols[1] if len(cols) > 1 else ""),
             "umbral_rep":  parse_num(cols[2] if len(cols) > 2 else ""),
@@ -438,7 +463,7 @@ async def get_config():
             "cupo_inst":   parse_num(cols[4] if len(cols) > 4 else ""),
             "cupo_rep":    parse_num(cols[5] if len(cols) > 5 else ""),
             "cupo_mud":    parse_num(cols[6] if len(cols) > 6 else ""),
-        })
+        }
     return result
 
 
