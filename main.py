@@ -385,7 +385,7 @@ def get_historico(dias: int = 30):
 
 
 @app.get("/config")
-def get_config():
+async def get_config():
     """
     Lee la hoja 'config' del Google Sheet y devuelve umbrales y cupos por localidad.
     Columnas: A=nombre, B=umbral_inst, C=umbral_rep, D=umbral_mud, E=cupo_inst, F=cupo_rep, G=cupo_mud
@@ -394,18 +394,17 @@ def get_config():
     if not GOOGLE_SHEETS_ID:
         return {"error": "GOOGLE_SHEETS_ID no configurado"}
 
-    import asyncio as _asyncio
-
-    async def _fetch():
-        url = (f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEETS_ID}"
-               f"/gviz/tq?tqx=out:csv&sheet=config")
+    url = (f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEETS_ID}"
+           f"/gviz/tq?tqx=out:csv&sheet=config")
+    try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
-                return await r.text() if r.status == 200 else ""
+                content = await r.text() if r.status == 200 else ""
+    except Exception as e:
+        return {"error": f"Error al leer sheet: {e}"}
 
-    content = _asyncio.get_event_loop().run_until_complete(_fetch())
     if not content or content.strip().startswith("<"):
-        return {"error": "No se pudo leer el sheet (¿es público?)"}
+        return {"error": "No se pudo leer el sheet (¿es público con 'cualquier persona puede ver'?)"}
 
     def parse_num(v):
         try:
