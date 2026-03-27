@@ -477,6 +477,26 @@ async def get_config():
     return result
 
 
+@app.get("/config-raw")
+async def get_config_raw():
+    """Debug: devuelve todas las filas del sheet config sin matching, con repr() para ver caracteres ocultos."""
+    if not GOOGLE_SHEETS_ID:
+        return {"error": "GOOGLE_SHEETS_ID no configurado"}
+    url = (f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEETS_ID}"
+           f"/gviz/tq?tqx=out:csv&sheet=config")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
+                content = await r.text() if r.status == 200 else ""
+    except Exception as e:
+        return {"error": str(e)}
+    lines = content.strip().split("\n")
+    return {
+        "total_lines": len(lines),
+        "lines": [{"index": i, "raw": line, "repr": repr(line)} for i, line in enumerate(lines)]
+    }
+
+
 @app.post("/sync")
 async def trigger_sync():
     """Dispara una sincronización manual."""
