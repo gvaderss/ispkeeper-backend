@@ -1,0 +1,448 @@
+"""
+ISPKeeper Dashboard — Backend
+==============================
+• Sincroniza tickets de ISPKeeper cada N minutos en background
+• Enriquece tickets sin localidad consultando el cliente vía API
+• Persiste en Google Sheets a través de un Apps Script (sin Google Cloud ni tarjeta)
+• Carga tickets en memoria al arrancar → el endpoint /tickets responde en < 10 ms
+• El Sheet puede ser público y visible por todo el equipo
+
+Variables de entorno requeridas:
+  ISPKEEPER_API_KEY       API key de ISPKeeper
+
+Variables para Google Sheets (opcionales — sin ellas solo usa memoria):
+  APPS_SCRIPT_URL         URL del Web App de Google Apps Script
+  APPS_SCRIPT_TOKEN       Token secreto definido en el Apps Script
+  GOOGLE_SHEETS_ID        ID del Google Spreadsheet (para leer al arrancar)
+
+Variables opcionales:
+  ISPKEEPER_BASE_URL      Default: https://api.anatod.ar/api
+  SYNC_INTERVAL_MIN       Default: 15
+  DIAS_VENTANA            Default: 120
+  BATCH_SIZE              Páginas en paralelo por batch. Default: 20
+"""
+
+from __future__ import annotations
+import asyncio, csv, io, logging, os
+from contextlib import asynccontextmanager
+from datetime import date, datetime, timedelta
+from typing import Any
+
+import aiohttp
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+# ─────────────────────────── CONFIG ────────────────────────────────────────
+API_KEY           = os.getenv("ISPKEEPER_API_KEY",  "mojEu45nVV39nGvDLhChW9MTe2rLmIUi4JZJabUD")
+ISPKEEPER_BASE    = os.getenv("ISPKEEPER_BASE_URL", "https://api.anatod.ar/api")
+SYNC_INTERVAL_MIN = int(os.getenv("SYNC_INTERVAL_MIN", "15"))
+DIAS_VENTANA      = int(os.getenv("DIAS_VENTANA",       "120"))
+BATCH_SIZE        = int(os.getenv("BATCH_SIZE",         "20"))
+CLIENT_BATCH_SIZE = 20
+
+APPS_SCRIPT_URL   = os.getenv("APPS_SCRIPT_URL",   "")
+APPS_SCRIPT_TOKEN = os.getenv("APPS_SCRIPT_TOKEN", "changeme")
+GOOGLE_SHEETS_ID  = os.getenv("GOOGLE_SHEETS_ID",  "")
+
+# ─────────────────────────── CATEGORÍAS ────────────────────────────────────
+SUBCAT_IDS: dict[int, set[int]] = {
+    1:   {16, 116, 280, 342, 343, 344},          # Instalación
+    2:   {267, 268, 108, 149, 281, 269},          # Reparación
+    120: {20, 270, 423},                          # Mudanza
+}
+TODOS_SUBCAT  = set().union(*SUBCAT_IDS.values())
+SUBCAT_TO_CAT = {sc: cat for cat, scs in SUBCAT_IDS.items() for sc in scs}
+
+TICKET_COLS   = ["ticket_id","ticket_subcategoria","ticket_categoria",
+                 "ticket_sucursal","ticket_visita_dia","ticket_dia",
+                 "ticket_cliente","synced_at"]
+SNAPSHOT_COLS = ["taken_at","sucursal_id","categoria_id","estado","cantidad"]
+SYNCLOG_COLS  = ["started_at","finished_at","tickets_found","duracion_seg","status","error_msg"]
+
+# ─────────────────────────── ESTADO EN MEMORIA ─────────────────────────────
+_tickets_cache:    list[dict] = []
+_last_sync_info:   dict       = {}
+_client_suc_cache: dict[int, int | None] = {}   # cliente_id → sucursal_id
+
+log = logging.getLogger("uvicorn.error")
+
+# ─────────────────────────── HELPERS ──────────────────────────────────────
+def _clasificar(ticket: dict) -> str:
+    vd = ticket.get("ticket_visita_dia")
+    if not vd or str(vd) in ("0000-00-00", "", "None"):
+        return "ab"
+    try:
+        return "ve" if date.fromisoformat(str(vd)[:10]) < date.today() else "ab"
+    except (ValueError, TypeError):
+        return "ab"
+
+# ─────────────────────────── GOOGLE SHEETS (vía Apps Script) ────────────────
+
+async def _sheets_post(session: aiohttp.ClientSession, payload: dict) -> None:
+    """Envía un POST al Apps Script. No bloquea el sync si falla."""
+    if not APPS_SCRIPT_URL:
+        return
+    try:
+        payload["token"] = APPS_SCRIPT_TOKEN
+        async with session.post(
+            APPS_SCRIPT_URL, json=payload,
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as r:
+            result = await r.json(content_type=None)
+            if result.get("error"):
+                log.warning(f"Apps Script error: {result['error']}")
+    except Exception as e:
+        log.warning(f"No se pudo escribir en Sheets: {e}")
+
+
+async def _sheets_save_tickets(
+    session: aiohttp.ClientSession,
+    tickets: list[dict],
+    now: str,
+) -> None:
+    rows = [
+        {col: (t.get(col) if t.get(col) is not None else "") for col in TICKET_COLS}
+        for t in tickets
+    ]
+    # Asegurar que synced_at esté en cada fila
+    for r in rows:
+        r["synced_at"] = now
+    await _sheets_post(session, {"action": "save_tickets", "tickets": rows})
+
+
+async def _sheets_append_snapshot(
+    session: aiohttp.ClientSession,
+    tickets: list[dict],
+    taken_at: str,
+) -> None:
+    agg: dict[tuple, int] = {}
+    for t in tickets:
+        key = (
+            t.get("ticket_sucursal") or "",
+            SUBCAT_TO_CAT.get(t.get("ticket_subcategoria"), 0),
+            _clasificar(t),
+        )
+        agg[key] = agg.get(key, 0) + 1
+
+    rows = [
+        {"taken_at": taken_at, "sucursal_id": suc, "categoria_id": cat,
+         "estado": est, "cantidad": cnt}
+        for (suc, cat, est), cnt in agg.items()
+    ]
+    await _sheets_post(session, {"action": "append_snapshot", "rows": rows})
+
+
+async def _sheets_append_sync_log(
+    session: aiohttp.ClientSession,
+    log_data: dict,
+) -> None:
+    await _sheets_post(session, {"action": "append_sync_log", "row": log_data})
+
+
+async def _sheets_load_tickets_on_startup() -> list[dict]:
+    """
+    Lee la tab 'tickets' del Sheet público como CSV para poblar el caché al arrancar.
+    Formato URL: .../export?format=csv&gid=0  (gid=0 asume que 'tickets' es la primera tab)
+    Si el Sheet tiene otro orden, cambiá gid por el correcto.
+    """
+    if not GOOGLE_SHEETS_ID:
+        return []
+    url = (f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEETS_ID}"
+           f"/gviz/tq?tqx=out:csv&sheet=tickets")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
+                if r.status != 200:
+                    log.warning(f"Sheets startup load: HTTP {r.status}")
+                    return []
+                content = await r.text()
+
+        reader = csv.DictReader(io.StringIO(content))
+        tickets: list[dict] = []
+        for row in reader:
+            try:
+                sc = int(row.get("ticket_subcategoria") or 0)
+                if sc not in TODOS_SUBCAT:
+                    continue
+                tickets.append({
+                    "ticket_id":           int(row.get("ticket_id") or 0),
+                    "ticket_subcategoria": sc,
+                    "ticket_categoria":    int(row.get("ticket_categoria") or 0),
+                    "ticket_sucursal":     int(row["ticket_sucursal"]) if row.get("ticket_sucursal") else None,
+                    "ticket_visita_dia":   row.get("ticket_visita_dia") or None,
+                    "ticket_dia":          row.get("ticket_dia")        or None,
+                    "ticket_cliente":      int(row["ticket_cliente"]) if row.get("ticket_cliente") else None,
+                })
+            except (ValueError, KeyError):
+                continue
+        log.info(f"Sheets startup: {len(tickets)} tickets cargados.")
+        return tickets
+    except Exception as e:
+        log.warning(f"Sheets startup load falló: {e}")
+        return []
+
+
+# ─────────────────────────── ENRIQUECIMIENTO DE LOCALIDAD ──────────────────
+ISP_HDR = {"X-API-Key": API_KEY, "X-Requested-With": "XMLHttpRequest"}
+
+
+async def _fetch_client(session: aiohttp.ClientSession, client_id: int) -> dict:
+    url = f"{ISPKEEPER_BASE}/cliente/{client_id}"
+    async with session.get(url, headers=ISP_HDR,
+                           timeout=aiohttp.ClientTimeout(total=15)) as r:
+        return await r.json(content_type=None)
+
+
+async def _enrich_localidad(
+    tickets: list[dict],
+    session: aiohttp.ClientSession,
+) -> list[dict]:
+    """
+    Completa ticket_sucursal para tickets que no la tienen pero sí tienen ticket_cliente.
+    Usa _client_suc_cache para no repetir llamadas a la API entre syncs.
+    """
+    sin_suc = [
+        t for t in tickets
+        if not t.get("ticket_sucursal") and t.get("ticket_cliente")
+    ]
+    if not sin_suc:
+        return tickets
+
+    ids_a_buscar = list(
+        {t["ticket_cliente"] for t in sin_suc} - set(_client_suc_cache.keys())
+    )
+    log.info(f"Enriquecimiento: {len(sin_suc)} tickets sin localidad, "
+             f"{len(ids_a_buscar)} clientes nuevos a resolver.")
+
+    for i in range(0, len(ids_a_buscar), CLIENT_BATCH_SIZE):
+        batch = ids_a_buscar[i : i + CLIENT_BATCH_SIZE]
+        results = await asyncio.gather(
+            *[_fetch_client(session, cid) for cid in batch],
+            return_exceptions=True,
+        )
+        for cid, res in zip(batch, results):
+            _client_suc_cache[cid] = (
+                res.get("cliente_sucursal") or None
+                if isinstance(res, dict) else None
+            )
+
+    for t in sin_suc:
+        suc = _client_suc_cache.get(t["ticket_cliente"])
+        if suc:
+            t["ticket_sucursal"] = suc
+
+    resueltos = sum(1 for t in sin_suc if t.get("ticket_sucursal"))
+    log.info(f"Enriquecimiento: {resueltos}/{len(sin_suc)} tickets con localidad asignada.")
+    return tickets
+
+
+# ─────────────────────────── SYNC ──────────────────────────────────────────
+_sync_lock = asyncio.Lock()
+
+
+async def _fetch_page(session: aiohttp.ClientSession, page: int, desde: str) -> dict:
+    url = f"{ISPKEEPER_BASE}/tickets?per_page=100&page={page}&altaDesde={desde}"
+    async with session.get(url, headers=ISP_HDR,
+                           timeout=aiohttp.ClientTimeout(total=30)) as r:
+        return await r.json(content_type=None)
+
+
+async def sync_tickets() -> None:
+    """
+    1. Descarga todos los tickets relevantes de ISPKeeper
+    2. Enriquece tickets sin localidad con datos del cliente
+    3. Actualiza la caché en memoria (swap atómico)
+    4. Persiste en Google Sheets vía Apps Script
+    """
+    global _tickets_cache, _last_sync_info
+
+    if _sync_lock.locked():
+        log.info("Sync ya en curso — saltando este ciclo.")
+        return
+
+    async with _sync_lock:
+        started = datetime.utcnow()
+
+        try:
+            desde  = (date.today() - timedelta(days=DIAS_VENTANA)).isoformat()
+            buffer: dict[int, dict] = {}
+
+            async with aiohttp.ClientSession() as session:
+                # ── Obtener total de páginas ───────────────────────────
+                first   = await _fetch_page(session, 1, desde)
+                last_pg = first.get("last_page", 1)
+
+                def _procesar(data: list | None) -> None:
+                    for t in (data or []):
+                        if (t.get("ticket_finalizado") != "Y"
+                                and t.get("ticket_subcategoria") in TODOS_SUBCAT):
+                            buffer[t["ticket_id"]] = t
+
+                _procesar(first.get("data"))
+                log.info(f"Sync iniciada — {last_pg} páginas desde {desde}")
+
+                # ── Páginas restantes (del final hacia el inicio) ───────
+                for end in range(last_pg, 0, -BATCH_SIZE):
+                    start = max(end - BATCH_SIZE + 1, 1)
+                    pages = [p for p in range(start, end + 1) if p != 1]
+                    if not pages:
+                        continue
+                    results = await asyncio.gather(
+                        *[_fetch_page(session, p, desde) for p in pages],
+                        return_exceptions=True,
+                    )
+                    for r in results:
+                        if isinstance(r, dict):
+                            _procesar(r.get("data"))
+
+                # ── Enriquecimiento de localidad ───────────────────────
+                tickets_data = await _enrich_localidad(list(buffer.values()), session)
+
+                # ── Actualizar caché en memoria ────────────────────────
+                now     = datetime.utcnow()
+                now_str = now.isoformat()
+                dur     = int((now - started).total_seconds())
+
+                _tickets_cache = tickets_data
+                _last_sync_info = {
+                    "started_at":    started.isoformat(),
+                    "finished_at":   now_str,
+                    "tickets_found": len(tickets_data),
+                    "duracion_seg":  dur,
+                    "status":        "ok",
+                    "error_msg":     None,
+                }
+                log.info(f"Sync OK — {len(tickets_data)} tickets en {dur}s")
+
+                # ── Persistir en Google Sheets ─────────────────────────
+                if APPS_SCRIPT_URL:
+                    await _sheets_save_tickets(session, tickets_data, now_str)
+                    await _sheets_append_snapshot(session, tickets_data, now_str)
+                    await _sheets_append_sync_log(session, {
+                        "started_at":    started.isoformat(),
+                        "finished_at":   now_str,
+                        "tickets_found": len(tickets_data),
+                        "duracion_seg":  dur,
+                        "status":        "ok",
+                        "error_msg":     "",
+                    })
+                    log.info("Sheets: datos enviados al Apps Script.")
+
+        except Exception as exc:
+            log.exception("Error en sync_tickets")
+            err_str = str(exc)
+            _last_sync_info = {
+                "started_at":  started.isoformat(),
+                "finished_at": datetime.utcnow().isoformat(),
+                "status":      "error",
+                "error_msg":   err_str,
+            }
+            if APPS_SCRIPT_URL:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        await _sheets_append_sync_log(session, {
+                            "started_at":  started.isoformat(),
+                            "finished_at": datetime.utcnow().isoformat(),
+                            "status":      "error",
+                            "error_msg":   err_str,
+                        })
+                except Exception:
+                    pass
+
+
+# ─────────────────────────── FASTAPI APP ───────────────────────────────────
+scheduler = AsyncIOScheduler(timezone="America/Argentina/Buenos_Aires")
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """
+    Al arrancar:
+    1. Si GOOGLE_SHEETS_ID está configurado, carga tickets del Sheet público → caché inmediata
+    2. Inicia scheduler y primera sync en background
+    """
+    if GOOGLE_SHEETS_ID:
+        log.info("Cargando tickets existentes desde Google Sheets…")
+        loaded = await _sheets_load_tickets_on_startup()
+        if loaded:
+            global _tickets_cache
+            _tickets_cache = loaded
+
+    scheduler.add_job(sync_tickets, "interval", minutes=SYNC_INTERVAL_MIN, id="sync")
+    scheduler.start()
+    asyncio.create_task(sync_tickets())   # primera sync inmediata en background
+    yield
+    scheduler.shutdown()
+
+
+app = FastAPI(title="ISPKeeper Dashboard API", version="3.0.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
+
+# ── Endpoints ───────────────────────────────────────────────────────────────
+
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "ISPKeeper Dashboard API", "version": "3.0.0"}
+
+
+@app.get("/tickets")
+def get_tickets():
+    """Tickets abiertos actuales desde caché en memoria. Respuesta < 10 ms."""
+    return _tickets_cache
+
+
+@app.get("/status")
+def get_status():
+    nj = scheduler.get_job("sync")
+    return {
+        "tickets_count":       len(_tickets_cache),
+        "sync_interval_min":   SYNC_INTERVAL_MIN,
+        "sheets_configurado":  bool(APPS_SCRIPT_URL),
+        "last_sync":           _last_sync_info or None,
+        "next_sync":           nj.next_run_time.isoformat() if nj and nj.next_run_time else None,
+    }
+
+
+@app.get("/historico")
+def get_historico(dias: int = 30):
+    """
+    Lee snapshots históricos desde la tab 'snapshots' del Google Sheet público.
+    Útil para graficar carga por día, vencimientos, etc.
+    """
+    if not GOOGLE_SHEETS_ID:
+        return {"error": "GOOGLE_SHEETS_ID no configurado"}
+
+    import asyncio as _asyncio
+
+    async def _fetch():
+        url = (f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEETS_ID}"
+               f"/gviz/tq?tqx=out:csv&sheet=snapshots")
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
+                return await r.text() if r.status == 200 else ""
+
+    content = _asyncio.get_event_loop().run_until_complete(_fetch())
+    if not content:
+        return []
+
+    desde_str = (datetime.utcnow() - timedelta(days=dias)).isoformat()
+    reader = csv.DictReader(io.StringIO(content))
+    return [
+        row for row in reader
+        if str(row.get("taken_at", "")) >= desde_str
+    ]
+
+
+@app.post("/sync")
+async def trigger_sync():
+    """Dispara una sincronización manual."""
+    asyncio.create_task(sync_tickets())
+    return {"message": "Sync iniciada en background"}
