@@ -395,26 +395,35 @@ async def get_config():
     if not GOOGLE_SHEETS_ID:
         return {"error": "GOOGLE_SHEETS_ID no configurado"}
 
-    # Mapping de nombres del sheet (normalizados) → código de grupo
     import unicodedata
 
     def norm(s: str) -> str:
+        """Normaliza acentos, quita marks, normaliza espacios a ASCII."""
         s = unicodedata.normalize("NFD", s)
         s = "".join(c for c in s if unicodedata.category(c) != "Mn")
-        return s.lower().strip()
+        s = " ".join(s.split())   # colapsa cualquier tipo de espacio (nbsp, tab, etc.)
+        return s.lower()
 
-    SHEET_TO_GRUPO = {
-        "rio gallegos":       "RG",
-        "las heras":          "LH",
-        "rio turbio":         "RT",
-        "gobernador gregores":"GG",
-        "puerto santa cruz":  "SC",
-        "san julian":         "SJ",
-        "piedra buena":       "PB",
-        "perito moreno":      "PM",
-        "tres lagos":         "TL",
-        "pico truncado":      "PC",
+    # Palabras clave únicas por grupo para substring matching
+    GRUPO_KEYWORDS = {
+        "RG": ["gallegos"],
+        "LH": ["heras"],
+        "RT": ["turbio"],
+        "GG": ["gregores"],
+        "SC": ["santa cruz"],
+        "SJ": ["julian"],
+        "PB": ["piedra buena", "piedrabuena"],
+        "PM": ["perito"],
+        "TL": ["lagos"],
+        "PC": ["truncado"],
     }
+
+    def match_grupo(nombre: str) -> str | None:
+        n = norm(nombre)
+        for grupo, keywords in GRUPO_KEYWORDS.items():
+            if any(kw in n for kw in keywords):
+                return grupo
+        return None
 
     url = (f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEETS_ID}"
            f"/gviz/tq?tqx=out:csv&sheet=config")
@@ -452,8 +461,9 @@ async def get_config():
         nombre = (cols[0] if cols else "").replace('"', '').strip()
         if not nombre:
             continue
-        grupo = SHEET_TO_GRUPO.get(norm(nombre))
+        grupo = match_grupo(nombre)
         if not grupo:
+            logger.warning("config: no se pudo mapear localidad '%s'", nombre)
             continue
         result[grupo] = {
             "nombre":      nombre,
