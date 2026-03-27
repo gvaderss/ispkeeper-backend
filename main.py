@@ -2,7 +2,7 @@
 ISPKeeper Dashboard — Backend
 ==============================
 • Sincroniza tickets de ISPKeeper cada N minutos en background
-• Enriquece tickets sin localidad consultando el cliente vía API
+• Usa ticket_grupo como campo de localidad (más preciso que ticket_sucursal)
 • Persiste en Google Sheets a través de un Apps Script (sin Google Cloud ni tarjeta)
 • Carga tickets en memoria al arrancar → el endpoint /tickets responde en < 10 ms
 • El Sheet puede ser público y visible por todo el equipo
@@ -39,7 +39,6 @@ ISPKEEPER_BASE    = os.getenv("ISPKEEPER_BASE_URL", "https://api.anatod.ar/api")
 SYNC_INTERVAL_MIN = int(os.getenv("SYNC_INTERVAL_MIN", "15"))
 DIAS_VENTANA      = int(os.getenv("DIAS_VENTANA",       "120"))
 BATCH_SIZE        = int(os.getenv("BATCH_SIZE",         "20"))
-CLIENT_BATCH_SIZE = 20
 
 APPS_SCRIPT_URL   = os.getenv("APPS_SCRIPT_URL",   "")
 APPS_SCRIPT_TOKEN = os.getenv("APPS_SCRIPT_TOKEN", "changeme")
@@ -55,15 +54,14 @@ TODOS_SUBCAT  = set().union(*SUBCAT_IDS.values())
 SUBCAT_TO_CAT = {sc: cat for cat, scs in SUBCAT_IDS.items() for sc in scs}
 
 TICKET_COLS   = ["ticket_id","ticket_subcategoria","ticket_categoria",
-                 "ticket_sucursal","ticket_visita_dia","ticket_dia",
+                 "ticket_grupo","ticket_visita_dia","ticket_dia",
                  "ticket_cliente","synced_at"]
-SNAPSHOT_COLS = ["taken_at","sucursal_id","categoria_id","estado","cantidad"]
+SNAPSHOT_COLS = ["taken_at","grupo_id","categoria_id","estado","cantidad"]
 SYNCLOG_COLS  = ["started_at","finished_at","tickets_found","duracion_seg","status","error_msg"]
 
 # ─────────────────────────── ESTADO EN MEMORIA ─────────────────────────────
 _tickets_cache:    list[dict] = []
 _last_sync_info:   dict       = {}
-_client_suc_cache: dict[int, int | None] = {}   # cliente_id → sucursal_id
 
 log = logging.getLogger("uvicorn.error")
 
@@ -119,16 +117,16 @@ async def _sheets_append_snapshot(
     agg: dict[tuple, int] = {}
     for t in tickets:
         key = (
-            t.get("ticket_sucursal") or "",
+            t.get("ticket_grupo") or "",
             SUBCAT_TO_CAT.get(t.get("ticket_subcategoria"), 0),
             _clasificar(t),
         )
         agg[key] = agg.get(key, 0) + 1
 
     rows = [
-        {"taken_at": taken_at, "sucursal_id": suc, "categoria_id": cat,
+        {"taken_at": taken_at, "grupo_id": grp, "categoria_id": cat,
          "estado": est, "cantidad": cnt}
-        for (suc, cat, est), cnt in agg.items()
+        for (grp, cat, est), cnt in agg.items()
     ]
     await _sheets_post(session, {"action": "append_snapshot", "rows": rows})
 
@@ -169,7 +167,7 @@ async def _sheets_load_tickets_on_startup() -> list[dict]:
                     "ticket_id":           int(row.get("ticket_id") or 0),
                     "ticket_subcategoria": sc,
                     "ticket_categoria":    int(row.get("ticket_categoria") or 0),
-                    "ticket_sucursal":     int(row["ticket_sucursal"]) if row.get("ticket_sucursal") else None,
+                    "ticket_grupo":        row.get("ticket_grupo") or None,
                     "ticket_visita_dia":   row.get("ticket_visita_dia") or None,
                     "ticket_dia":          row.get("ticket_dia")        or None,
                     "ticket_cliente":      int(row["ticket_cliente"]) if row.get("ticket_cliente") else None,
@@ -183,61 +181,8 @@ async def _sheets_load_tickets_on_startup() -> list[dict]:
         return []
 
 
-# ─────────────────────────── ENRIQUECIMIENTO DE LOCALIDAD ──────────────────
-ISP_HDR = {"X-API-Key": API_KEY, "X-Requested-With": "XMLHttpRequest"}
-
-
-async def _fetch_client(session: aiohttp.ClientSession, client_id: int) -> dict:
-    url = f"{ISPKEEPER_BASE}/cliente/{client_id}"
-    async with session.get(url, headers=ISP_HDR,
-                           timeout=aiohttp.ClientTimeout(total=15)) as r:
-        return await r.json(content_type=None)
-
-
-async def _enrich_localidad(
-    tickets: list[dict],
-    session: aiohttp.ClientSession,
-) -> list[dict]:
-    """
-    Completa ticket_sucursal para tickets que no la tienen pero sí tienen ticket_cliente.
-    Usa _client_suc_cache para no repetir llamadas a la API entre syncs.
-    """
-    sin_suc = [
-        t for t in tickets
-        if not t.get("ticket_sucursal") and t.get("ticket_cliente")
-    ]
-    if not sin_suc:
-        return tickets
-
-    ids_a_buscar = list(
-        {t["ticket_cliente"] for t in sin_suc} - set(_client_suc_cache.keys())
-    )
-    log.info(f"Enriquecimiento: {len(sin_suc)} tickets sin localidad, "
-             f"{len(ids_a_buscar)} clientes nuevos a resolver.")
-
-    for i in range(0, len(ids_a_buscar), CLIENT_BATCH_SIZE):
-        batch = ids_a_buscar[i : i + CLIENT_BATCH_SIZE]
-        results = await asyncio.gather(
-            *[_fetch_client(session, cid) for cid in batch],
-            return_exceptions=True,
-        )
-        for cid, res in zip(batch, results):
-            _client_suc_cache[cid] = (
-                res.get("cliente_sucursal") or None
-                if isinstance(res, dict) else None
-            )
-
-    for t in sin_suc:
-        suc = _client_suc_cache.get(t["ticket_cliente"])
-        if suc:
-            t["ticket_sucursal"] = suc
-
-    resueltos = sum(1 for t in sin_suc if t.get("ticket_sucursal"))
-    log.info(f"Enriquecimiento: {resueltos}/{len(sin_suc)} tickets con localidad asignada.")
-    return tickets
-
-
 # ─────────────────────────── SYNC ──────────────────────────────────────────
+ISP_HDR    = {"X-API-Key": API_KEY, "X-Requested-With": "XMLHttpRequest"}
 _sync_lock = asyncio.Lock()
 
 
@@ -251,9 +196,9 @@ async def _fetch_page(session: aiohttp.ClientSession, page: int, desde: str) -> 
 async def sync_tickets() -> None:
     """
     1. Descarga todos los tickets relevantes de ISPKeeper
-    2. Enriquece tickets sin localidad con datos del cliente
-    3. Actualiza la caché en memoria (swap atómico)
-    4. Persiste en Google Sheets vía Apps Script
+    2. Actualiza la caché en memoria (swap atómico)
+    3. Persiste en Google Sheets vía Apps Script
+    Localidad: se lee de ticket_grupo (siempre presente en la API, no requiere enriquecimiento).
     """
     global _tickets_cache, _last_sync_info
 
@@ -296,10 +241,8 @@ async def sync_tickets() -> None:
                         if isinstance(r, dict):
                             _procesar(r.get("data"))
 
-                # ── Enriquecimiento de localidad ───────────────────────
-                tickets_data = await _enrich_localidad(list(buffer.values()), session)
-
                 # ── Actualizar caché en memoria ────────────────────────
+                tickets_data = list(buffer.values())
                 now     = datetime.utcnow()
                 now_str = now.isoformat()
                 dur     = int((now - started).total_seconds())
