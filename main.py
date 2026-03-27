@@ -444,7 +444,7 @@ async def get_config():
             return None
 
     lines = content.strip().split("\n")
-    data_lines = lines[2:]  # saltar 2 filas de encabezado
+    data_lines = lines[1:]  # saltar 1 fila de encabezado (el CSV del gviz solo tiene 1)
     result = {}
     for line in data_lines:
         cols = []
