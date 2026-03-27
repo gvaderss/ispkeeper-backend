@@ -418,7 +418,7 @@ async def get_config():
         "PC": ["truncado"],
     }
 
-    def match_grupo(nombre: str) -> str | None:
+    def match_grupo(nombre: str):
         n = norm(nombre)
         for grupo, keywords in GRUPO_KEYWORDS.items():
             if any(kw in n for kw in keywords):
