@@ -384,6 +384,65 @@ def get_historico(dias: int = 30):
     ]
 
 
+@app.get("/config")
+def get_config():
+    """
+    Lee la hoja 'config' del Google Sheet y devuelve umbrales y cupos por localidad.
+    Columnas: A=nombre, B=umbral_inst, C=umbral_rep, D=umbral_mud, E=cupo_inst, F=cupo_rep, G=cupo_mud
+    Datos desde fila 3 (se saltan 2 filas de encabezado).
+    """
+    if not GOOGLE_SHEETS_ID:
+        return {"error": "GOOGLE_SHEETS_ID no configurado"}
+
+    import asyncio as _asyncio
+
+    async def _fetch():
+        url = (f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEETS_ID}"
+               f"/gviz/tq?tqx=out:csv&sheet=config")
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
+                return await r.text() if r.status == 200 else ""
+
+    content = _asyncio.get_event_loop().run_until_complete(_fetch())
+    if not content or content.strip().startswith("<"):
+        return {"error": "No se pudo leer el sheet (¿es público?)"}
+
+    def parse_num(v):
+        try:
+            return float(v.replace(",", ".").strip()) if v and v.strip() else None
+        except ValueError:
+            return None
+
+    lines = content.strip().split("\n")
+    data_lines = lines[2:]  # saltar 2 filas de encabezado
+    result = []
+    for line in data_lines:
+        cols = []
+        cur, in_q = "", False
+        for ch in line:
+            if ch == '"':
+                in_q = not in_q
+            elif ch == "," and not in_q:
+                cols.append(cur.strip())
+                cur = ""
+            else:
+                cur += ch
+        cols.append(cur.strip())
+        nombre = (cols[0] if cols else "").replace('"', '').strip()
+        if not nombre:
+            continue
+        result.append({
+            "nombre":      nombre,
+            "umbral_inst": parse_num(cols[1] if len(cols) > 1 else ""),
+            "umbral_rep":  parse_num(cols[2] if len(cols) > 2 else ""),
+            "umbral_mud":  parse_num(cols[3] if len(cols) > 3 else ""),
+            "cupo_inst":   parse_num(cols[4] if len(cols) > 4 else ""),
+            "cupo_rep":    parse_num(cols[5] if len(cols) > 5 else ""),
+            "cupo_mud":    parse_num(cols[6] if len(cols) > 6 else ""),
+        })
+    return result
+
+
 @app.post("/sync")
 async def trigger_sync():
     """Dispara una sincronización manual."""
