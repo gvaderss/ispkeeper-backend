@@ -300,6 +300,16 @@ async def sync_tickets() -> None:
 
 
 # ─────────────────────────── FASTAPI APP ───────────────────────────────────
+async def _sync_si_activo():
+    """Ejecuta sync solo entre 7:30 y 23:30 hora Argentina."""
+    ahora = now_arg()
+    inicio = ahora.replace(hour=7,  minute=30, second=0, microsecond=0)
+    fin    = ahora.replace(hour=23, minute=30, second=0, microsecond=0)
+    if inicio <= ahora <= fin:
+        await sync_tickets()
+    else:
+        log.info("Sync omitida fuera de horario (%s)", ahora.strftime("%H:%M"))
+
 scheduler = AsyncIOScheduler(timezone="America/Argentina/Buenos_Aires")
 
 
@@ -317,7 +327,8 @@ async def lifespan(_: FastAPI):
             global _tickets_cache
             _tickets_cache = loaded
 
-    scheduler.add_job(sync_tickets, "interval", minutes=SYNC_INTERVAL_MIN, id="sync")
+    # Sync cada 90 minutos, solo entre 7:30 y 23:30 hora Argentina
+    scheduler.add_job(_sync_si_activo, "interval", minutes=90, id="sync")
     scheduler.start()
     asyncio.create_task(sync_tickets())   # primera sync inmediata en background
     yield
@@ -352,7 +363,8 @@ def get_status():
     nj = scheduler.get_job("sync")
     return {
         "tickets_count":       len(_tickets_cache),
-        "sync_interval_min":   SYNC_INTERVAL_MIN,
+        "sync_interval_min":   90,
+        "sync_horario":        "07:30 - 23:30",
         "sheets_configurado":  bool(APPS_SCRIPT_URL),
         "last_sync":           _last_sync_info or None,
         "next_sync":           nj.next_run_time.isoformat() if nj and nj.next_run_time else None,
