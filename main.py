@@ -300,15 +300,6 @@ async def sync_tickets() -> None:
 
 
 # ─────────────────────────── FASTAPI APP ───────────────────────────────────
-async def _sync_si_activo():
-    """Ejecuta sync solo entre 7:30 y 23:30 hora Argentina."""
-    ahora = now_arg()
-    inicio = ahora.replace(hour=7,  minute=30, second=0, microsecond=0)
-    fin    = ahora.replace(hour=23, minute=30, second=0, microsecond=0)
-    if inicio <= ahora <= fin:
-        await sync_tickets()
-    else:
-        log.info("Sync omitida fuera de horario (%s)", ahora.strftime("%H:%M"))
 
 scheduler = AsyncIOScheduler(timezone="America/Argentina/Buenos_Aires")
 
@@ -327,8 +318,12 @@ async def lifespan(_: FastAPI):
             global _tickets_cache
             _tickets_cache = loaded
 
-    # Sync cada 90 minutos, solo entre 7:30 y 23:30 hora Argentina
-    scheduler.add_job(_sync_si_activo, "interval", minutes=90, id="sync")
+    # Sync en horarios fijos hora Argentina: 11:00, 14:00, 17:30, 19:00, 23:30
+    scheduler.add_job(sync_tickets, "cron", hour=11, minute=0,  id="sync_1100", timezone="America/Argentina/Buenos_Aires")
+    scheduler.add_job(sync_tickets, "cron", hour=14, minute=0,  id="sync_1400", timezone="America/Argentina/Buenos_Aires")
+    scheduler.add_job(sync_tickets, "cron", hour=17, minute=30, id="sync_1730", timezone="America/Argentina/Buenos_Aires")
+    scheduler.add_job(sync_tickets, "cron", hour=19, minute=0,  id="sync_1900", timezone="America/Argentina/Buenos_Aires")
+    scheduler.add_job(sync_tickets, "cron", hour=23, minute=30, id="sync_2330", timezone="America/Argentina/Buenos_Aires")
     scheduler.start()
     asyncio.create_task(sync_tickets())   # primera sync inmediata en background
     yield
@@ -363,8 +358,7 @@ def get_status():
     nj = scheduler.get_job("sync")
     return {
         "tickets_count":       len(_tickets_cache),
-        "sync_interval_min":   90,
-        "sync_horario":        "07:30 - 23:30",
+        "sync_horarios":       "11:00 · 14:00 · 17:30 · 19:00 · 23:30",
         "sheets_configurado":  bool(APPS_SCRIPT_URL),
         "last_sync":           _last_sync_info or None,
         "next_sync":           nj.next_run_time.isoformat() if nj and nj.next_run_time else None,
